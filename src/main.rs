@@ -185,6 +185,29 @@ impl ArangoConfig {
     }
 }
 
+fn init_tracing(service_name: &'static str) {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let log_format = env::var("ELOWEN_LOG_FORMAT").unwrap_or_else(|_| "plain".to_string());
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(true);
+
+    if log_format.eq_ignore_ascii_case("json") {
+        builder
+            .json()
+            .with_current_span(false)
+            .with_span_list(false)
+            .flatten_event(true)
+            .with_ansi(false)
+            .init();
+    } else {
+        builder.with_ansi(true).init();
+    }
+
+    info!(service = service_name, log_format = %log_format, "tracing initialized");
+}
+
 fn persistent_index(fields: &[&str], name: &'static str, unique: bool, sparse: bool) -> Value {
     json!({
         "type": "persistent",
@@ -221,9 +244,7 @@ fn notes_search_properties() -> Value {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    init_tracing("elowen-notes");
 
     let arango = ArangoConfig::from_env()?;
     let client = Client::builder().build()?;
