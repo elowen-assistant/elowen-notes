@@ -85,6 +85,9 @@ struct NoteRevision {
     body_markdown: String,
     frontmatter: Value,
     created_at: DateTime<Utc>,
+    previous_revision_id: Option<String>,
+    authored_by: Option<NoteAuthor>,
+    source_references: Vec<NoteSourceReference>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -103,6 +106,7 @@ struct SearchNotesQuery {
 
 #[derive(Debug, Deserialize)]
 struct PromoteNoteRequest {
+    note_id: Option<String>,
     source_kind: Option<String>,
     source_id: Option<String>,
     title: Option<String>,
@@ -115,6 +119,37 @@ struct PromoteNoteRequest {
     aliases: Vec<String>,
     note_type: Option<String>,
     frontmatter: Option<Value>,
+    authored_by: Option<NoteAuthor>,
+    #[serde(default)]
+    source_references: Vec<NoteSourceReference>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct NoteAuthor {
+    actor_type: String,
+    actor_id: String,
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct NoteSourceReference {
+    source_kind: String,
+    source_id: String,
+    label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingNoteHead {
+    note_id: String,
+    title: String,
+    slug: String,
+    tags: Vec<String>,
+    aliases: Vec<String>,
+    note_type: String,
+    source_kind: Option<String>,
+    source_id: Option<String>,
+    current_revision_id: String,
+    current_version: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,7 +392,10 @@ async fn get_note(
                 summary: revision.summary,
                 body_markdown: revision.body_markdown,
                 frontmatter: revision.frontmatter,
-                created_at: revision.created_at
+                created_at: revision.created_at,
+                previous_revision_id: revision.previous_revision_id,
+                authored_by: revision.authored_by,
+                source_references: revision.source_references != null ? revision.source_references : []
             }
         }
         "#,
@@ -382,40 +420,74 @@ async fn promote_note(
         )));
     }
 
-    let note_id = Ulid::new().to_string();
+    let existing_note = match sanitize_optional_string(request.note_id.clone()) {
+        Some(note_id) => Some(load_note_head(&state, &note_id).await?),
+        None => None,
+    };
+    let note_id = existing_note
+        .as_ref()
+        .map(|note| note.note_id.clone())
+        .unwrap_or_else(|| Ulid::new().to_string());
     let revision_id = Ulid::new().to_string();
     let created_at = Utc::now();
-    let source_kind = sanitize_optional_string(request.source_kind);
-    let source_id = sanitize_optional_string(request.source_id);
+    let source_kind = sanitize_optional_string(request.source_kind).or_else(|| {
+        existing_note
+            .as_ref()
+            .and_then(|note| note.source_kind.clone())
+    });
+    let source_id = sanitize_optional_string(request.source_id).or_else(|| {
+        existing_note
+            .as_ref()
+            .and_then(|note| note.source_id.clone())
+    });
     let title = sanitize_optional_string(request.title)
+        .or_else(|| existing_note.as_ref().map(|note| note.title.clone()))
         .or_else(|| derive_title(&body_markdown))
         .unwrap_or_else(|| format!("Promoted Note {}", &note_id[..8].to_ascii_lowercase()));
-    let slug_base = sanitize_optional_string(request.slug)
-        .unwrap_or_else(|| slugify(&title))
-        .trim_matches('-')
-        .to_string();
-    let slug = if slug_base.is_empty() {
-        note_id.to_ascii_lowercase()
+    let slug = if let Some(existing_note) = existing_note.as_ref() {
+        sanitize_optional_string(request.slug).unwrap_or_else(|| existing_note.slug.clone())
     } else {
-        format!("{slug_base}-{}", &note_id[..8].to_ascii_lowercase())
+        let slug_base = sanitize_optional_string(request.slug)
+            .unwrap_or_else(|| slugify(&title))
+            .trim_matches('-')
+            .to_string();
+        if slug_base.is_empty() {
+            note_id.to_ascii_lowercase()
+        } else {
+            format!("{slug_base}-{}", &note_id[..8].to_ascii_lowercase())
+        }
     };
     let summary =
         sanitize_optional_string(request.summary).unwrap_or_else(|| derive_summary(&body_markdown));
-    let note_type =
-        sanitize_optional_string(request.note_type).unwrap_or_else(|| "general".to_string());
+    let note_type = sanitize_optional_string(request.note_type)
+        .or_else(|| existing_note.as_ref().map(|note| note.note_type.clone()))
+        .unwrap_or_else(|| "general".to_string());
     let frontmatter = request.frontmatter.unwrap_or_else(|| json!({}));
-    let tags = request
-        .tags
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let aliases = request
-        .aliases
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
+    let tags = normalize_optional_list(request.tags)
+        .or_else(|| existing_note.as_ref().map(|note| note.tags.clone()))
+        .unwrap_or_default();
+    let aliases = normalize_optional_list(request.aliases)
+        .or_else(|| existing_note.as_ref().map(|note| note.aliases.clone()))
+        .unwrap_or_default();
+    let previous_revision_id = existing_note
+        .as_ref()
+        .map(|note| note.current_revision_id.clone());
+    let version = existing_note
+        .as_ref()
+        .map(|note| note.current_version + 1)
+        .unwrap_or(1);
+    let authored_by = normalize_note_author(request.authored_by).or_else(|| {
+        Some(NoteAuthor {
+            actor_type: "system".to_string(),
+            actor_id: "elowen-notes".to_string(),
+            display_name: Some("Elowen Notes".to_string()),
+        })
+    });
+    let source_references = normalize_source_references(
+        request.source_references,
+        source_kind.as_deref(),
+        source_id.as_deref(),
+    );
 
     ensure_note_type(&state.client, &state.arango, &note_type).await?;
 
@@ -427,36 +499,59 @@ async fn promote_note(
             "_key": revision_id,
             "revision_id": revision_id,
             "note_id": note_id,
-            "version": 1,
+            "version": version,
             "summary": summary,
             "body_markdown": body_markdown,
             "frontmatter": frontmatter,
             "created_at": created_at,
+            "previous_revision_id": previous_revision_id,
+            "authored_by": authored_by,
+            "source_references": source_references,
         }),
     )
     .await?;
 
-    insert_document(
-        &state.client,
-        &state.arango,
-        "notes",
-        json!({
-            "_key": note_id,
-            "note_id": note_id,
-            "title": title,
-            "slug": slug,
-            "tags": tags,
-            "aliases": aliases,
-            "note_type": note_type,
-            "source_kind": source_kind,
-            "source_id": source_id,
-            "current_revision_id": revision_id,
-            "current_revision_key": revision_id,
-            "created_at": created_at,
-            "updated_at": created_at,
-        }),
-    )
-    .await?;
+    if existing_note.is_some() {
+        update_note_head(
+            &state,
+            &note_id,
+            json!({
+                "title": title,
+                "slug": slug,
+                "tags": tags,
+                "aliases": aliases,
+                "note_type": note_type,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "current_revision_id": revision_id,
+                "current_revision_key": revision_id,
+                "updated_at": created_at,
+            }),
+        )
+        .await?;
+    } else {
+        insert_document(
+            &state.client,
+            &state.arango,
+            "notes",
+            json!({
+                "_key": note_id,
+                "note_id": note_id,
+                "title": title,
+                "slug": slug,
+                "tags": tags,
+                "aliases": aliases,
+                "note_type": note_type,
+                "source_kind": source_kind,
+                "source_id": source_id,
+                "current_revision_id": revision_id,
+                "current_revision_key": revision_id,
+                "created_at": created_at,
+                "updated_at": created_at,
+            }),
+        )
+        .await?;
+    }
 
     let detail = get_note(State(state), Path(note_id)).await?.0;
     Ok((StatusCode::CREATED, Json(detail)))
@@ -518,6 +613,30 @@ async fn bootstrap_arangodb(client: &Client, config: &ArangoConfig) -> anyhow::R
     ensure_index(
         client,
         config,
+        "note_revisions",
+        persistent_index(
+            &["note_id", "version"],
+            "idx_revisions_note_version",
+            true,
+            false,
+        ),
+    )
+    .await?;
+    ensure_index(
+        client,
+        config,
+        "note_revisions",
+        persistent_index(
+            &["previous_revision_id"],
+            "idx_revisions_previous_revision",
+            false,
+            true,
+        ),
+    )
+    .await?;
+    ensure_index(
+        client,
+        config,
         "note_types",
         persistent_index(&["type_key"], "idx_note_types_type_key", true, false),
     )
@@ -538,6 +657,53 @@ async fn bootstrap_arangodb(client: &Client, config: &ArangoConfig) -> anyhow::R
     ensure_search_view(client, config).await?;
 
     info!(database = %config.database, "ArangoDB bootstrap complete");
+    Ok(())
+}
+
+async fn load_note_head(state: &AppState, note_id: &str) -> Result<ExistingNoteHead, AppError> {
+    let mut results = run_aql::<ExistingNoteHead>(
+        &state.client,
+        &state.arango,
+        r#"
+        LET note = DOCUMENT(CONCAT("notes/", @note_id))
+        FILTER note != null
+        LET revision = DOCUMENT(CONCAT("note_revisions/", note.current_revision_key))
+        RETURN {
+            note_id: note.note_id,
+            title: note.title,
+            slug: note.slug,
+            tags: note.tags,
+            aliases: note.aliases,
+            note_type: note.note_type,
+            source_kind: note.source_kind,
+            source_id: note.source_id,
+            current_revision_id: note.current_revision_id,
+            current_version: revision != null ? revision.version : 0
+        }
+        "#,
+        json!({ "note_id": note_id }),
+    )
+    .await?;
+
+    results
+        .pop()
+        .ok_or_else(|| AppError::not_found(anyhow!("note not found")))
+}
+
+async fn update_note_head(state: &AppState, note_id: &str, patch: Value) -> Result<(), AppError> {
+    run_aql::<Value>(
+        &state.client,
+        &state.arango,
+        r#"
+        UPDATE { _key: @note_id } WITH @patch IN notes
+        RETURN NEW
+        "#,
+        json!({
+            "note_id": note_id,
+            "patch": patch,
+        }),
+    )
+    .await?;
     Ok(())
 }
 
@@ -822,6 +988,71 @@ fn sanitize_optional_string(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn normalize_optional_list(values: Vec<String>) -> Option<Vec<String>> {
+    let normalized = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalize_note_author(author: Option<NoteAuthor>) -> Option<NoteAuthor> {
+    let mut author = author?;
+    author.actor_type = author.actor_type.trim().to_string();
+    author.actor_id = author.actor_id.trim().to_string();
+    author.display_name = sanitize_optional_string(author.display_name);
+
+    if author.actor_type.is_empty() || author.actor_id.is_empty() {
+        return None;
+    }
+
+    Some(author)
+}
+
+fn normalize_source_references(
+    references: Vec<NoteSourceReference>,
+    source_kind: Option<&str>,
+    source_id: Option<&str>,
+) -> Vec<NoteSourceReference> {
+    let mut normalized = references
+        .into_iter()
+        .filter_map(|reference| {
+            let source_kind = reference.source_kind.trim().to_string();
+            let source_id = reference.source_id.trim().to_string();
+            if source_kind.is_empty() || source_id.is_empty() {
+                return None;
+            }
+
+            Some(NoteSourceReference {
+                source_kind,
+                source_id,
+                label: sanitize_optional_string(reference.label),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let has_primary_reference = normalized.iter().any(|reference| {
+        Some(reference.source_kind.as_str()) == source_kind
+            && Some(reference.source_id.as_str()) == source_id
+    });
+
+    if !has_primary_reference {
+        if let (Some(source_kind), Some(source_id)) = (source_kind, source_id) {
+            normalized.insert(
+                0,
+                NoteSourceReference {
+                    source_kind: source_kind.to_string(),
+                    source_id: source_id.to_string(),
+                    label: None,
+                },
+            );
+        }
+    }
+
+    normalized
 }
 
 fn derive_title(body_markdown: &str) -> Option<String> {
