@@ -13,9 +13,19 @@ Migration guardrail:
 
 - domain IDs and service contracts must stay database-agnostic so the internals can be migrated to MongoDB later if needed
 
-## Initial Scope
+## Current Responsibilities
 
 - note creation and versioning
 - tags and note types
 - source references
 - keyword and filtered retrieval
+- explicit note revision ancestry
+- authored-by metadata for promoted knowledge
+- thread and job note lookup through `elowen-api`
+- job-note revision updates instead of parallel duplicate note creation
+
+## Runtime Notes
+
+`elowen-notes` keeps ArangoDB-specific behavior inside the service boundary. API and UI callers should continue to treat note identifiers and payloads as service contracts rather than database records.
+
+The VPS deployment runs this service from a prebuilt GHCR image rather than compiling on the server.
