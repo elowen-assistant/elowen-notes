@@ -1,31 +1,52 @@
 # elowen-notes
 
-Rust service for versioned notes and promoted knowledge. It is the canonical store for note documents that graduate from transient thread/job context into reusable memory.
+## Purpose
 
-The service is ArangoDB-backed so notes can be modeled as documents plus explicit graph edges:
-
-- note documents hold Markdown content and frontmatter-like metadata
-- link relationships are stored explicitly for backlinks and traversal
-- ArangoSearch can power keyword retrieval over note titles, summaries, and bodies
-- attachments can remain separate documents with references from notes
-
-Migration guardrail:
-
-- domain IDs and service contracts must stay database-agnostic so the internals can be migrated to MongoDB later if needed
+Rust notes service for promoted knowledge. It stores versioned note documents, note revisions, authored-by metadata, and source references behind a service-level API rather than exposing ArangoDB details directly.
 
 ## Current Responsibilities
 
-- note creation and versioning
-- tags and note types
-- source references
-- keyword and filtered retrieval
-- explicit note revision ancestry
-- authored-by metadata for promoted knowledge
-- thread and job note lookup through `elowen-api`
-- job-note revision updates instead of parallel duplicate note creation
+- search notes by text, source filters, and recency
+- load the current revision for a note by id
+- promote markdown into a new note or a new note revision
+- normalize titles, summaries, tags, aliases, and source references
+- bootstrap required ArangoDB collections and note types at startup
 
-## Runtime Notes
+## Repository Layout
 
-`elowen-notes` keeps ArangoDB-specific behavior inside the service boundary. API and UI callers should continue to treat note identifiers and payloads as service contracts rather than database records.
+- `src/service/` - note search and promotion handlers plus promotion helpers
+- `src/arangodb/` - ArangoDB bootstrap and low-level client helpers
+- `src/routes.rs` - HTTP route wiring
+- `src/models.rs` - API contracts and persisted note shapes
+- `src/normalize.rs` - input normalization helpers
+- `src/state.rs` - shared application state
 
-The VPS deployment runs this service from a prebuilt GHCR image rather than compiling on the server.
+## Runtime And Config Entrypoints
+
+Run locally with:
+
+```bash
+cargo run
+```
+
+Important environment variables:
+
+- `ARANGO_URL`
+- `ARANGO_DATABASE`
+- `ARANGO_USERNAME`
+- `ARANGO_PASSWORD`
+- `PORT`
+
+## Local Verification
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --quiet
+cargo doc --no-deps
+```
+
+## Related Docs
+
+- `src/arangodb/`
+- `../elowen-platform/db/`

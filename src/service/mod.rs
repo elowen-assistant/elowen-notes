@@ -1,15 +1,14 @@
 //! Core note retrieval and promotion behavior.
 
+mod promotion;
+
 use crate::{
     AppError,
     arangodb::{
         bootstrap::ensure_note_type,
         client::{insert_document, run_aql},
     },
-    models::{
-        ExistingNoteHead, NoteAuthor, NoteDetail, NoteSourceReference, NoteSummary,
-        PromoteNoteRequest, SearchNotesQuery,
-    },
+    models::{NoteDetail, NoteSummary, PromoteNoteRequest, SearchNotesQuery},
     normalize::{
         derive_summary, derive_title, normalize_note_author, normalize_optional_list,
         normalize_source_references, sanitize_optional_string, slugify,
@@ -23,8 +22,12 @@ use axum::{
     http::StatusCode,
 };
 use chrono::Utc;
-use serde_json::{Value, json};
+use serde_json::json;
 use ulid::Ulid;
+
+use self::promotion::{
+    RevisionDocument, default_author, load_note_head, revision_document, update_note_head,
+};
 
 /// Searches notes using the current query filters.
 pub(crate) async fn search_notes(
@@ -271,90 +274,6 @@ pub(crate) async fn promote_note(
 
     let detail = get_note(State(state), Path(note_id)).await?.0;
     Ok((StatusCode::CREATED, Json(detail)))
-}
-
-struct RevisionDocument<'a> {
-    revision_id: &'a str,
-    note_id: &'a str,
-    version: i32,
-    summary: &'a str,
-    body_markdown: &'a str,
-    frontmatter: Value,
-    created_at: chrono::DateTime<Utc>,
-    previous_revision_id: Option<String>,
-    authored_by: Option<NoteAuthor>,
-    source_references: Vec<NoteSourceReference>,
-}
-
-fn revision_document(value: RevisionDocument<'_>) -> Value {
-    json!({
-        "_key": value.revision_id,
-        "revision_id": value.revision_id,
-        "note_id": value.note_id,
-        "version": value.version,
-        "summary": value.summary,
-        "body_markdown": value.body_markdown,
-        "frontmatter": value.frontmatter,
-        "created_at": value.created_at,
-        "previous_revision_id": value.previous_revision_id,
-        "authored_by": value.authored_by,
-        "source_references": value.source_references,
-    })
-}
-
-fn default_author() -> Option<NoteAuthor> {
-    Some(NoteAuthor {
-        actor_type: "system".to_string(),
-        actor_id: "elowen-notes".to_string(),
-        display_name: Some("Elowen Notes".to_string()),
-    })
-}
-
-async fn load_note_head(state: &AppState, note_id: &str) -> Result<ExistingNoteHead, AppError> {
-    let mut results = run_aql::<ExistingNoteHead>(
-        &state.client,
-        &state.arango,
-        r#"
-        LET note = DOCUMENT(CONCAT("notes/", @note_id))
-        FILTER note != null
-        LET revision = DOCUMENT(CONCAT("note_revisions/", note.current_revision_key))
-        RETURN {
-            note_id: note.note_id,
-            title: note.title,
-            slug: note.slug,
-            tags: note.tags,
-            aliases: note.aliases,
-            note_type: note.note_type,
-            source_kind: note.source_kind,
-            source_id: note.source_id,
-            current_revision_id: note.current_revision_id,
-            current_version: revision != null ? revision.version : 0
-        }
-        "#,
-        json!({ "note_id": note_id }),
-    )
-    .await?;
-
-    results
-        .pop()
-        .ok_or_else(|| AppError::not_found(anyhow!("note not found")))
-}
-
-async fn update_note_head(state: &AppState, note_id: &str, patch: Value) -> Result<(), AppError> {
-    run_aql::<Value>(
-        &state.client,
-        &state.arango,
-        r#"
-        UPDATE { _key: @note_id } WITH @patch IN notes
-        RETURN NEW
-        "#,
-        json!({
-            "note_id": note_id,
-            "patch": patch,
-        }),
-    )
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]
