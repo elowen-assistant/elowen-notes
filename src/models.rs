@@ -18,6 +18,10 @@ pub struct NoteSummary {
     pub source_id: Option<String>,
     pub current_revision_id: String,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub relevance_score: f64,
+    #[serde(default)]
+    pub match_reasons: Vec<String>,
 }
 
 /// Stored note revision payload.
@@ -46,9 +50,17 @@ pub struct NoteDetail {
 #[derive(Debug, Deserialize)]
 pub struct SearchNotesQuery {
     pub q: Option<String>,
+    /// Additional free-text context used for ranking without replacing `q`.
+    pub context: Option<String>,
     pub limit: Option<usize>,
     pub source_kind: Option<String>,
     pub source_id: Option<String>,
+    /// Comma-separated list of note ids to boost in ranking.
+    pub prefer_note_ids: Option<String>,
+    /// Preferred source kind to boost in ranking without filtering.
+    pub prefer_source_kind: Option<String>,
+    /// Preferred source id to boost in ranking without filtering.
+    pub prefer_source_id: Option<String>,
 }
 
 /// Promotion request used to create a note or append a revision.

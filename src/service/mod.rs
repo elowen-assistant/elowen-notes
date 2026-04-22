@@ -35,8 +35,12 @@ pub(crate) async fn search_notes(
     Query(query): Query<SearchNotesQuery>,
 ) -> Result<Json<Vec<NoteSummary>>, AppError> {
     let search_text = query.q.unwrap_or_default().trim().to_string();
+    let context_text = query.context.unwrap_or_default().trim().to_string();
     let source_kind = sanitize_optional_string(query.source_kind);
     let source_id = sanitize_optional_string(query.source_id);
+    let prefer_note_ids = parse_csv_list(query.prefer_note_ids);
+    let prefer_source_kind = sanitize_optional_string(query.prefer_source_kind);
+    let prefer_source_id = sanitize_optional_string(query.prefer_source_id);
     let limit = query.limit.unwrap_or(8).clamp(1, 20) as i64;
 
     let notes = run_aql::<NoteSummary>(
@@ -47,16 +51,43 @@ pub(crate) async fn search_notes(
             LET revision = note.current_revision_key == null
                 ? null
                 : DOCUMENT(CONCAT("note_revisions/", note.current_revision_key))
+            LET title_text = LOWER(note.title)
+            LET slug_text = LOWER(note.slug)
+            LET summary_text = revision != null && revision.summary != null ? LOWER(revision.summary) : ""
+            LET body_text = revision != null && revision.body_markdown != null ? LOWER(revision.body_markdown) : ""
+            LET query_text = LOWER(@query)
+            LET context_query = LOWER(@context)
+            LET query_title_match = @query != "" && CONTAINS(title_text, query_text)
+            LET query_slug_match = @query != "" && CONTAINS(slug_text, query_text)
+            LET query_summary_match = @query != "" && CONTAINS(summary_text, query_text)
+            LET query_body_match = @query != "" && CONTAINS(body_text, query_text)
+            LET context_title_match = @context != "" && CONTAINS(title_text, context_query)
+            LET context_summary_match = @context != "" && CONTAINS(summary_text, context_query)
+            LET context_body_match = @context != "" && CONTAINS(body_text, context_query)
+            LET preferred_note_match = LENGTH(@prefer_note_ids) > 0 && POSITION(@prefer_note_ids, note.note_id)
+            LET preferred_source_match = @prefer_source_kind != null
+                && note.source_kind == @prefer_source_kind
+                && (@prefer_source_id == null OR note.source_id == @prefer_source_id)
+            LET query_score =
+                (query_title_match ? 140 : 0)
+                + (query_slug_match ? 120 : 0)
+                + (query_summary_match ? 80 : 0)
+                + (query_body_match ? 35 : 0)
+            LET context_score =
+                (context_title_match ? 45 : 0)
+                + (context_summary_match ? 30 : 0)
+                + (context_body_match ? 15 : 0)
+            LET preference_score =
+                (preferred_note_match ? 220 : 0)
+                + (preferred_source_match ? 180 : 0)
+            LET relevance_score = query_score + context_score + preference_score
             FILTER (@source_kind == null OR note.source_kind == @source_kind)
                 AND (@source_id == null OR note.source_id == @source_id)
                 AND (
-                    @query == ""
-                    OR CONTAINS(LOWER(note.title), LOWER(@query))
-                    OR CONTAINS(LOWER(note.slug), LOWER(@query))
-                    OR (revision != null AND revision.summary != null AND CONTAINS(LOWER(revision.summary), LOWER(@query)))
-                    OR (revision != null AND revision.body_markdown != null AND CONTAINS(LOWER(revision.body_markdown), LOWER(@query)))
+                    (@query == "" AND @context == "" AND LENGTH(@prefer_note_ids) == 0 AND @prefer_source_kind == null)
+                    OR relevance_score > 0
                 )
-            SORT note.updated_at DESC
+            SORT relevance_score DESC, note.updated_at DESC
             LIMIT @limit
             RETURN {
                 note_id: note.note_id,
@@ -69,14 +100,44 @@ pub(crate) async fn search_notes(
                 source_kind: note.source_kind,
                 source_id: note.source_id,
                 current_revision_id: note.current_revision_id,
-                updated_at: note.updated_at
+                updated_at: note.updated_at,
+                relevance_score: relevance_score,
+                match_reasons: APPEND(
+                    preferred_source_match ? ["preferred_source"] : [],
+                    APPEND(
+                        preferred_note_match ? ["preferred_note"] : [],
+                        APPEND(
+                            query_title_match ? ["query_title"] : [],
+                            APPEND(
+                                query_slug_match ? ["query_slug"] : [],
+                                APPEND(
+                                    query_summary_match ? ["query_summary"] : [],
+                                    APPEND(
+                                        query_body_match ? ["query_body"] : [],
+                                        APPEND(
+                                            context_title_match ? ["context_title"] : [],
+                                            APPEND(
+                                                context_summary_match ? ["context_summary"] : [],
+                                                context_body_match ? ["context_body"] : []
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
             }
         "#,
         json!({
             "query": search_text,
+            "context": context_text,
             "limit": limit,
             "source_kind": source_kind,
             "source_id": source_id,
+            "prefer_note_ids": prefer_note_ids,
+            "prefer_source_kind": prefer_source_kind,
+            "prefer_source_id": prefer_source_id,
         }),
     )
     .await?;
@@ -276,6 +337,16 @@ pub(crate) async fn promote_note(
     Ok((StatusCode::CREATED, Json(detail)))
 }
 
+fn parse_csv_list(value: Option<String>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +369,13 @@ mod tests {
         assert_eq!(value["revision_id"], "rev-1");
         assert_eq!(value["previous_revision_id"], "rev-0");
         assert_eq!(value["version"], 2);
+    }
+
+    #[test]
+    fn parse_csv_list_ignores_empty_entries() {
+        assert_eq!(
+            parse_csv_list(Some(" note-1, ,note-2 ,, note-3 ".to_string())),
+            vec!["note-1", "note-2", "note-3"]
+        );
     }
 }
